@@ -8,7 +8,7 @@ import math  # Python 內建的數學函式庫，用於計算距離
 # 定義 MoveNet TFLite 模型的檔案路徑
 MODEL_PATH = "D:\\user\\Downloads\\MoveNet\\MoveNet_YOLOv8\\movenet_lightning.tflite"
 # 定義要使用的 YOLO 模型檔案，'yolov8n.pt' 是輕量級的 nano 版本，速度快
-YOLO_MODEL = 'yolov8s.pt'
+YOLO_MODEL = 'yolov8n.pt'
 # 設定要使用的攝影機 ID，0 通常代表電腦的預設內建攝影機
 WEBCAM_ID = 0
 
