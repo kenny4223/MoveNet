@@ -1,0 +1,304 @@
+import cv2  # OpenCV 函式庫，主要用於影像處理、讀取攝影機畫面、繪圖等
+import tensorflow as tf  # TensorFlow 函式庫，用於載入和執行 MoveNet TFLite 模型
+from ultralytics import YOLO  # 從 ultralytics 函式庫中引入 YOLO 類，用於執行物件偵測
+import numpy as np  # NumPy 函式庫，用於高效的數值運算，特別是陣列操作
+import math  # Python 內建的數學函式庫，用於計算距離
+
+# --- 常數設定 ---
+# 定義 MoveNet TFLite 模型的檔案路徑
+MODEL_PATH = "D:\\user\\Downloads\\MoveNet\\MoveNet_YOLOv8\\movenet_lightning.tflite"
+# 定義要使用的 YOLO 模型檔案，'yolov8n.pt' 是輕量級的 nano 版本，速度快
+YOLO_MODEL = 'yolov8s.pt'
+# 設定要使用的攝影機 ID，0 通常代表電腦的預設內建攝影機
+WEBCAM_ID = 0
+
+# MoveNet 關鍵點名稱與其在模型輸出陣列中索引的對應字典
+# MoveNet 會輸出一個包含 17 個關鍵點的陣列，這個字典讓我們可以用名稱來方便地存取特定關鍵點
+KEYPOINT_DICT = {
+    'nose': 0, 'left_eye': 1, 'right_eye': 2, 'left_ear': 3, 'right_ear': 4,
+    'left_shoulder': 5, 'right_shoulder': 6, 'left_elbow': 7, 'right_elbow': 8,
+    'left_wrist': 9, 'right_wrist': 10, 'left_hip': 11, 'right_hip': 12,
+    'left_knee': 13, 'right_knee': 14, 'left_ankle': 15, 'right_ankle': 16
+}
+
+# 定義關鍵點之間的連接關係，用於繪製人體骨架
+# 列表中的每個元組 (tuple) 代表一條連線，元組中的兩個數字是 KEYPOINT_DICT 中關鍵點的索引
+KEYPOINT_EDGE_MAP = [
+    (0, 1), (0, 2), (1, 3), (2, 4),  # 臉部
+    (5, 6),  # 肩膀
+    (5, 7), (7, 9),  # 左臂
+    (6, 8), (8, 10),  # 右臂
+    (11, 12),  # 臀部
+    (11, 13), (13, 15),  # 左腿
+    (12, 14), (14, 16),  # 右腿
+    (5, 11), (6, 12)  # 身體軀幹
+]
+
+# 設定 MoveNet 關鍵點的最低信心度分數閾值
+# 只有當 MoveNet 偵測到的關鍵點信心度高於此值時，我們才認為它是有效的
+MIN_KEYPOINT_SCORE = 0.3
+
+# 設定 YOLO 物件偵測的最低信心度分數閾值
+# 只有當 YOLO 偵測到的物件信心度高於此值時，我們才接受這個結果
+YOLO_CONFIDENCE_THRESHOLD = 0.25
+
+def get_scaled_keypoints(keypoints, bbox_x, bbox_y, bbox_w, bbox_h):
+    """
+    [MoveNet 核心輔助函式]
+    將 MoveNet 輸出的歸一化關鍵點座標，轉換為相對於原始影像幀的絕對像素座標。
+    """
+    # 初始化一個空列表，用於存放轉換後的關鍵點
+    scaled_keypoints = []
+    # 遍歷 MoveNet 輸出的 17 個關鍵點
+    for kp in keypoints:
+        # 從每個關鍵點中解構出 y, x 座標和信心度分數
+        y, x, score = kp
+        # 計算絕對 x 座標：邊界框起始 x + (歸一化 x * 邊界框寬度)
+        scaled_x = int(bbox_x + x * bbox_w)
+        # 計算絕對 y 座標：邊界框起始 y + (歸一化 y * 邊界框高度)
+        scaled_y = int(bbox_y + y * bbox_h)
+        # 將計算出的絕對座標和原始分數存入列表中
+        scaled_keypoints.append((scaled_x, scaled_y, score))
+    # 返回包含所有轉換後關鍵點的列表
+    return scaled_keypoints
+
+def draw_keypoints_and_connections(frame, scaled_keypoints, confidence_threshold):
+    """
+    [MoveNet 核心輔助函式]
+    在給定的影像幀上，根據轉換後的絕對座標繪製 MoveNet 關鍵點 (點) 和骨架 (線)。
+    """
+    # 遍歷所有轉換後的關鍵點
+    for x, y, score in scaled_keypoints:
+        # 檢查關鍵點的信心度是否高於閾值
+        if score > confidence_threshold:
+            # 如果高於閾值，就在 (x, y) 位置畫一個半徑為 4 的實心圓點 (顏色為青色)
+            cv2.circle(frame, (x, y), 4, (0, 255, 255), -1)
+
+    # 遍歷定義好的骨架連接關係
+    for edge in KEYPOINT_EDGE_MAP:
+        # 獲取一條連線的起始點和結束點的索引
+        p1_idx, p2_idx = edge
+        # 從關鍵點列表中獲取起始點的座標和分數
+        p1_x, p1_y, p1_score = scaled_keypoints[p1_idx]
+        # 從關鍵點列表中獲取結束點的座標和分數
+        p2_x, p2_y, p2_score = scaled_keypoints[p2_idx]
+
+        # 檢查這條連線的兩個端點的信心度是否都高於閾值
+        if p1_score > confidence_threshold and p2_score > confidence_threshold:
+            # 如果都高於閾值，就在這兩個點之間畫一條綠色的線，粗細為 2
+            cv2.line(frame, (p1_x, p1_y), (p2_x, p2_y), (0, 255, 0), 2)
+
+def check_person_object_interaction(scaled_keypoints, objects_data, person_width, confidence_threshold):
+    """
+    [MoveNet 核心應用函式]
+    檢查人物的手腕與偵測到的物品之間是否存在互動關係 (例如 "持有")。
+    """
+    # 初始化一個空列表，用於存放偵測到的互動結果
+    interactions = []
+    
+    # 使用 KEYPOINT_DICT 從關鍵點列表中獲取左手腕的座標和分數
+    left_wrist_x, left_wrist_y, left_wrist_score = scaled_keypoints[KEYPOINT_DICT['left_wrist']]
+    # 使用 KEYPOINT_DICT 從關鍵點列表中獲取右手腕的座標和分數
+    right_wrist_x, right_wrist_y, right_wrist_score = scaled_keypoints[KEYPOINT_DICT['right_wrist']]
+
+    # 動態計算互動距離的閾值，設定為人物邊界框寬度的 60%，讓判斷更具彈性
+    interaction_threshold = person_width * 0.2
+
+    # 遍歷所有被 YOLO 偵測到的物品
+    for obj in objects_data:
+        # 獲取物品的類別名稱 (例如 'cell phone')
+        obj_class = obj['class_name']
+        # 獲取物品的邊界框座標
+        x1, y1, x2, y2 = obj['bbox']
+        # 計算物品的中心點 x 座標
+        obj_center_x = (x1 + x2) // 2
+        # 計算物品的中心點 y 座標
+        obj_center_y = (y1 + y2) // 2
+
+        # 檢查左手腕的信心度是否足夠高
+        if left_wrist_score > confidence_threshold:
+            # 計算左手腕與物品中心點之間的歐幾里得距離
+            distance = math.sqrt((left_wrist_x - obj_center_x)**2 + (left_wrist_y - obj_center_y)**2)
+            # 如果距離小於我們動態計算的閾值
+            if distance < interaction_threshold:
+                # 就認定為 "持有" 互動，並將描述字串加入結果列表
+                interactions.append(f"Holding: {obj_class}")
+                # 繼續檢查下一個物品 (避免同一個手腕與多個物品判斷為互動)
+                continue
+
+        # 檢查右手腕的信心度是否足夠高
+        if right_wrist_score > confidence_threshold:
+            # 計算右手腕與物品中心點之間的歐幾里得距離
+            distance = math.sqrt((right_wrist_x - obj_center_x)**2 + (right_wrist_y - obj_center_y)**2)
+            # 如果距離小於我們動態計算的閾值
+            if distance < interaction_threshold:
+                # 就認定為 "持有" 互動，並將描述字串加入結果列表
+                interactions.append(f"Holding: {obj_class}")
+
+    # 返回包含所有互動描述的列表
+    return interactions
+
+def draw_interactions(frame, interactions, person_bbox):
+    """
+    在畫面上指定位置顯示偵測到的互動文字。
+    """
+    # 獲取人物邊界框的左上角座標
+    x1, y1, _, _ = person_bbox
+    # 遍歷所有互動描述文字
+    for i, text in enumerate(interactions):
+        # 使用 OpenCV 的 putText 函式，在人物頭像上方依序顯示文字
+        cv2.putText(frame, text, (x1, y1 - 25 - (i * 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
+
+
+def main():
+    """
+    程式執行的主函式，整合了 YOLOv8 和 MoveNet 的所有流程。
+    """
+    # 在終端機印出提示，表示正在載入模型
+    print("Loading models...")
+    # 使用 try-except 結構來捕捉可能的錯誤，例如模型檔案不存在
+    try:
+        # 載入 YOLOv8 模型
+        yolo_model = YOLO(YOLO_MODEL)
+        # 載入 MoveNet TFLite 模型解釋器
+        movenet_interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        # 為 MoveNet 模型分配記憶體
+        movenet_interpreter.allocate_tensors()
+        # 在終端機印出提示，表示模型載入成功
+        print("Models loaded successfully.")
+    except Exception as e:
+        # 如果載入過程中發生任何錯誤，印出錯誤訊息並結束程式
+        print(f"Error loading models: {e}")
+        return
+
+    # 開啟指定的攝影機
+    cap = cv2.VideoCapture(WEBCAM_ID)
+    # 檢查攝影機是否成功開啟
+    if not cap.isOpened():
+        # 如果開啟失敗，印出錯誤訊息並結束程式
+        print(f"Error: Cannot open camera with ID {WEBCAM_ID}")
+        return
+
+    # 在終端機印出提示，告知使用者程式已開始，並如何退出
+    print("Starting video capture... Press 'q' to quit.")
+
+    # 定義我們感興趣的物件類別列表
+    target_classes = ['person', 'cell phone', 'handbag', 'suitcase', 'backpack', 'teddy bear', 'bottle', 'umbrella']
+
+    # 進入主迴圈，持續處理攝影機的每一幀畫面
+    while True:
+        # 從攝影機讀取一幀畫面，ret 表示是否成功讀取，frame 是讀取到的影像
+        ret, frame = cap.read()
+        # 如果讀取失敗 (例如攝影機被拔除)，就跳出迴圈
+        if not ret:
+            break
+
+        # [YOLO 步驟 - **優化**] 使用追蹤功能 (track) 而非僅偵測 (predict)，以提高穩定性
+        results = yolo_model.track(frame, persist=True, verbose=False)
+        display_frame = frame.copy()
+        
+        persons_data = []
+        objects_data = []
+
+        # 檢查是否有追蹤結果
+        if results and results[0].boxes and results[0].boxes.id is not None:
+            # 獲取追蹤的 boxes, confidences, class_ids, 和 track_ids
+            boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+            confidences = results[0].boxes.conf.cpu().numpy()
+            class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+            track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+
+            for i in range(len(boxes)):
+                class_name = yolo_model.names[class_ids[i]]
+                confidence = confidences[i]
+
+                if class_name in target_classes and confidence > YOLO_CONFIDENCE_THRESHOLD:
+                    x1, y1, x2, y2 = boxes[i]
+                    bbox = [x1, y1, x2, y2]
+
+                    if class_name == 'person':
+                        # 將其邊界框和追蹤 ID 存入人物列表中
+                        persons_data.append({'bbox': bbox, 'track_id': track_ids[i]})
+                    else:
+                        objects_data.append({'class_name': class_name, 'bbox': bbox})
+
+                    # 在畫面上繪製該物件的邊界框
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    # 準備要顯示的標籤文字，如果是人物，則加上追蹤 ID 和信心度
+                    label = f'{class_name}: {confidence:.2f}'
+                    (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                    cv2.rectangle(display_frame, (x1, y1 - 20), (x1 + w, y1), (0, 255, 0), -1)
+                    cv2.putText(display_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        # [MoveNet 步驟] 遍歷所有被 YOLO 偵測到的「人物」
+        for person in persons_data:
+            # 獲取人物的邊界框座標
+            x1, y1, x2, y2 = person['bbox']
+
+            # --- [MoveNet 預處理 - **優化**] 保持長寬比進行裁切，以提高準確度 ---
+            # 1. 計算中心點和最大邊長
+            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+            box_size = max(x2 - x1, y2 - y1)
+            
+            # 2. 計算方形裁切區域的左上角和右下角座標，並確保不超出畫面邊界
+            x1_sq = max(0, center_x - box_size // 2)
+            y1_sq = max(0, center_y - box_size // 2)
+            x2_sq = min(frame.shape[1], x1_sq + box_size)
+            y2_sq = min(frame.shape[0], y1_sq + box_size)
+            
+            # 3. 根據計算出的方形區域，從原始影像中裁切
+            cropped_person = frame[y1_sq:y2_sq, x1_sq:x2_sq]
+
+            # 如果裁切出的影像無效，則跳過此人物
+            if cropped_person.shape[0] == 0 or cropped_person.shape[1] == 0:
+                continue
+
+            # 4. 將裁切好的方形影像縮放到 MoveNet 模型需要的固定輸入尺寸 (192x192)
+            input_image = cv2.resize(cropped_person, (192, 192))
+            # -------------------- **優化結束** --------------------
+
+            # [MoveNet 預處理] 為影像增加一個維度 (batch dimension)
+            input_image = np.expand_dims(input_image, axis=0)
+            # [MoveNet 預處理] 確保影像資料型態為 uint8
+            input_image = input_image.astype(np.uint8)
+
+            # [MoveNet 推理] 執行模型推理
+            movenet_interpreter.set_tensor(movenet_interpreter.get_input_details()[0]['index'], input_image)
+            movenet_interpreter.invoke()
+            keypoints_with_scores = movenet_interpreter.get_tensor(movenet_interpreter.get_output_details()[0]['index'])
+            keypoints = keypoints_with_scores[0, 0] 
+
+            # [MoveNet 後處理 - **優化**] 將歸一化座標轉換回相對於「方形裁切區域」的絕對像素座標
+            scaled_keypoints = get_scaled_keypoints(keypoints, x1_sq, y1_sq, x2_sq - x1_sq, y2_sq - y1_sq)
+            
+            # [MoveNet 視覺化] 繪製關鍵點和骨架
+            draw_keypoints_and_connections(display_frame, scaled_keypoints, MIN_KEYPOINT_SCORE)
+
+            # [MoveNet 應用] 檢查人物與物品的互動
+            person_width = x2 - x1 # 互動距離的判斷基準仍然使用原始的人物框寬度
+            interactions = check_person_object_interaction(scaled_keypoints, objects_data, person_width, MIN_KEYPOINT_SCORE)
+            
+            # [MoveNet 應用] 將互動結果文字繪製到畫面上
+            draw_interactions(display_frame, interactions, person['bbox'])
+
+        # 顯示最終處理完畢、包含所有繪圖結果的影像幀
+        cv2.imshow('MoveNet + YOLOv8 Action Recognition', display_frame)
+
+        # 等待 1 毫秒，並檢查使用者是否按下了 'q' 鍵
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            # 如果按下了 'q'，就跳出主迴圈
+            break
+
+    # 迴圈結束後，在終端機印出提示
+    print("Cleaning up and closing.")
+    # 釋放攝影機資源
+    cap.release()
+    # 關閉所有 OpenCV 建立的視窗
+    cv2.destroyAllWindows()
+    # 在終端機印出提示，表示程式已完全結束
+    print("Program finished.")
+
+# 這是 Python 的標準寫法，確保只有當這個腳本被直接執行時，main() 函式才會被呼叫
+if __name__ == "__main__":
+    main()
